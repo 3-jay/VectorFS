@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+import os, sys, time, argparse, math
+import numpy as np
+import torch
+from PIL import Image
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+from sklearn.cluster import Birch
+import pandas as pd
+import csv
+from ops_mm_embedding_v1 import OpsMMEmbeddingV1
+
+# --- CONFIG ---
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"}
+SKIP_EXTS = {".zip", ".gz", ".tar", ".exe", ".so", ".dll", ".class", ".pdf", ".swf", ".jar"}
+
+def get_mem_usage():
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 ** 3)  # Returns GB
+    except ImportError:
+        return 0.0
+
+def log_heartbeat(msg: str):
+    with open("heartbeat.log", "a") as f:
+        f.write(f"{time.ctime()}: {msg}\n")
+
+def is_image(p: str) -> bool:
+    return os.path.splitext(p)[1].lower() in IMG_EXTS
+
+def is_binary(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(1024)
+            return b"\0" in chunk
+    except Exception:
+        return True
+
+def list_files_recursive(root: str) -> list:
+    out = []
+    log_heartbeat(f"Scanning directory: {root}")
+    for dp, _, fns in os.walk(root):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            
+            # 1. Image Check
+            if is_image(p):
+                out.append(p)
+                continue
+            
+            # 2. Blocklist Check
+            ext = os.path.splitext(p)[1].lower()
+            if ext in SKIP_EXTS:
+                continue
+
+            # 3. Binary Content Check (Safety Fallback)
+            if not is_binary(p):
+                out.append(p)
+    return sorted(out)
+
+def load_image(path: str):
+    try:
+        return Image.open(path).convert("RGB")
+    except Exception: return None
+
+def read_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read(25000).strip() # Truncate to ~8k tokens to prevent OOM
+    except Exception: return None
+
+def l2_normalize(x: torch.Tensor) -> torch.Tensor:
+    return x / x.norm(p=2, dim=-1, keepdim=True)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", required=True)
+    ap.add_argument("--repo", default="OpenSearch-AI/Ops-MM-embedding-v1-2B")
+    ap.add_argument("--cache", default="govdocs_vectors.csv")
+    ap.add_argument("--batch", type=int, default=1)
+    ap.add_argument("--limit", type=int, default=None, help="Stop after this many files")
+    args = ap.parse_args()
+
+    # --- 1. EMBEDDING PHASE ---
+    processed_files = set()
+    X_list = []
+    
+    # Load existing data if available
+    if os.path.exists(args.cache) and os.path.getsize(args.cache) > 0:
+        print(f"Loading existing cache: {args.cache}")
+        try:
+            df = pd.read_csv(args.cache)
+            processed_files = set(df.iloc[:, 0].tolist())
+            print(f"Loaded {len(processed_files)} previously processed files.")
+        except Exception as e:
+            print(f"Warning: Could not read cache {args.cache}: {e}. Starting fresh.")
+    
+    # Discovery
+    files = list_files_recursive(args.root)
+    files_to_process = [f for f in files if os.path.basename(f) not in processed_files]
+    
+    if args.limit:
+        remaining_slots = args.limit - len(processed_files)
+        if remaining_slots <= 0:
+             print(f"Limit of {args.limit} reached with existing {len(processed_files)} files.")
+             files_to_process = []
+        else:
+             print(f"Limit applied: Processing {remaining_slots} more files.")
+             files_to_process = files_to_process[:remaining_slots]
+
+    print(f"Found {len(files)} total files. Processing {len(files_to_process)} new files. Device: CPU | Model: 2B")
+    
+    if files_to_process:
+        # Force truncation to 8192 tokens to prevent CPU OOM on dense files
+        model = OpsMMEmbeddingV1(args.repo, device="cpu", attn_implementation="sdpa", max_length=8192)
+        
+        # Open in APPEND mode
+        mode = "a" if (os.path.exists(args.cache) and os.path.getsize(args.cache) > 0) else "w"
+        with open(args.cache, mode, newline="") as f_out:
+            writer = csv.writer(f_out)
+            
+            # Write header only if new file
+            header_written = mode == "a"
+            
+            import gc
+            
+            for i, p in enumerate(files_to_process):
+                filename = os.path.basename(p)
+                log_heartbeat(f"Starting {filename} | Mem: {get_mem_usage():.2f}GB")
+                
+                # Explicit GC every 50 files
+                if i > 0 and i % 50 == 0:
+                    gc.collect()
+
+                start_time = time.perf_counter()
+                vec = None
+                
+                try:
+                    if is_image(p):
+                        img = load_image(p)
+                        if img:
+                            res = model.get_image_embeddings([img])
+                            vec = l2_normalize(res).float().cpu().numpy()[0]
+                    else:
+                        txt = read_text(p)
+                        if txt:
+                            res = model.get_text_embeddings([txt])
+                            vec = l2_normalize(res).float().cpu().numpy()[0]
+                except Exception as e:
+                    print(f"ERROR processing {filename}: {e}")
+                    log_heartbeat(f"ERROR on {filename}: {e}")
+                    continue
+
+                if vec is not None:
+                    if not header_written:
+                        writer.writerow(["filename"] + [f"d{d}" for d in range(len(vec))])
+                        header_written = True
+                    writer.writerow([filename] + vec.tolist())
+                    f_out.flush()
+                
+                elapsed = time.perf_counter() - start_time
+                print(f"[{i+1}/{len(files_to_process)}] Processed {filename} in {elapsed:.2f}s | Mem: {get_mem_usage():.2f}GB")
+    
+    # Re-load for clustering
+    if os.path.exists(args.cache) and os.path.getsize(args.cache) > 0:
+        df = pd.read_csv(args.cache)
+        X = df.iloc[:, 1:].to_numpy(dtype=np.float32)
+    else:
+        print("No data found.")
+        return
+
+    # --- 2. CLUSTERING & PLOTTING ---
+    if len(X) < 2:
+        print("Not enough vectors to cluster.")
+        return
+
+    print(f"Running t-SNE and BIRCH on {len(X)} vectors...")
+    Z = TSNE(n_components=2, perplexity=min(30, len(X)-1), random_state=0).fit_transform(X)
+    y_birch = Birch(n_clusters=None, threshold=0.7).fit_predict(X)
+    
+    plt.figure(figsize=(12, 10))
+    plt.scatter(Z[:, 0], Z[:, 1], c=y_birch, cmap='tab20', s=40, alpha=0.7)
+    plt.title(f"BIRCH Clusters (found {len(np.unique(y_birch))} clusters)")
+    plt.colorbar(label='Cluster ID')
+    
+    plot_path = "final_birch_plot.png"
+    plt.savefig(plot_path, dpi=300)
+    print(f"Done! Plot saved to {plot_path}")
+
+if __name__ == "__main__":
+    main()
