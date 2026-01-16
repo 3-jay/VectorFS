@@ -8,7 +8,7 @@ from sklearn.manifold import TSNE
 from sklearn.cluster import Birch
 import pandas as pd
 import csv
-from ops_mm_embedding_v1 import OpsMMEmbeddingV1
+from qwen3_vl_embedding import Qwen3VLEmbedder
 
 # --- CONFIG ---
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"}
@@ -67,18 +67,14 @@ def load_image(path: str):
 def read_text(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read(25000).strip() # Truncate to ~8k tokens to prevent OOM
+            return f.read(25000).strip() # Truncate to avoid excessive memory on huge files
     except Exception: return None
-
-def l2_normalize(x: torch.Tensor) -> torch.Tensor:
-    return x / x.norm(p=2, dim=-1, keepdim=True)
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True)
-    ap.add_argument("--repo", default="OpenSearch-AI/Ops-MM-embedding-v1-2B")
+    ap.add_argument("--repo", default="Qwen/Qwen3-VL-Embedding-8B")
     ap.add_argument("--cache", default="govdocs_vectors.csv")
-    ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--limit", type=int, default=None, help="Stop after this many files")
     args = ap.parse_args()
 
@@ -109,11 +105,12 @@ def main():
              print(f"Limit applied: Processing {remaining_slots} more files.")
              files_to_process = files_to_process[:remaining_slots]
 
-    print(f"Found {len(files)} total files. Processing {len(files_to_process)} new files. Device: CPU | Model: 2B")
+    print(f"Found {len(files)} total files. Processing {len(files_to_process)} new files. Model: {args.repo}")
     
     if files_to_process:
-        # Force truncation to 8192 tokens to prevent CPU OOM on dense files
-        model = OpsMMEmbeddingV1(args.repo, device="cpu", attn_implementation="sdpa", max_length=8192)
+        # Initialize Qwen3-VL Embedder
+        # Note: torch_dtype and default device handling is done inside the class, but we can pass kwargs if needed
+        model = Qwen3VLEmbedder(model_name_or_path=args.repo)
         
         # Open in APPEND mode
         mode = "a" if (os.path.exists(args.cache) and os.path.getsize(args.cache) > 0) else "w"
@@ -137,16 +134,21 @@ def main():
                 vec = None
                 
                 try:
+                    inputs = []
                     if is_image(p):
                         img = load_image(p)
                         if img:
-                            res = model.get_image_embeddings([img])
-                            vec = l2_normalize(res).float().cpu().numpy()[0]
+                            inputs = [{'image': img}]
                     else:
                         txt = read_text(p)
                         if txt:
-                            res = model.get_text_embeddings([txt])
-                            vec = l2_normalize(res).float().cpu().numpy()[0]
+                            inputs = [{'text': txt}]
+                    
+                    if inputs:
+                        # process returns a tensor of shape (1, hidden_size)
+                        res = model.process(inputs)
+                        vec = res.float().cpu().numpy()[0]
+
                 except Exception as e:
                     print(f"ERROR processing {filename}: {e}")
                     log_heartbeat(f"ERROR on {filename}: {e}")
@@ -176,7 +178,11 @@ def main():
         return
 
     print(f"Running t-SNE and BIRCH on {len(X)} vectors...")
-    Z = TSNE(n_components=2, perplexity=min(30, len(X)-1), random_state=0).fit_transform(X)
+    # Adjust perplexity for small datasets
+    perplexity = min(30, len(X)-1)
+    if perplexity < 1: perplexity = 1
+    
+    Z = TSNE(n_components=2, perplexity=perplexity, random_state=0).fit_transform(X)
     y_birch = Birch(n_clusters=None, threshold=0.7).fit_predict(X)
     
     plt.figure(figsize=(12, 10))
