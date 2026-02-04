@@ -8,6 +8,7 @@ from sklearn.manifold import TSNE
 from sklearn.cluster import Birch
 import pandas as pd
 import csv
+from transformers import BitsAndBytesConfig
 from qwen3_vl_embedding import Qwen3VLEmbedder
 
 # --- CONFIG ---
@@ -109,8 +110,16 @@ def main():
     
     if files_to_process:
         # Initialize Qwen3-VL Embedder
-        # Note: torch_dtype and default device handling is done inside the class, but we can pass kwargs if needed
-        model = Qwen3VLEmbedder(model_name_or_path=args.repo)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16
+        )
+        model = Qwen3VLEmbedder(
+            model_name_or_path=args.repo,
+            quantization_config=bnb_config,
+            device_map="auto"
+        )
         
         # Open in APPEND mode
         mode = "a" if (os.path.exists(args.cache) and os.path.getsize(args.cache) > 0) else "w"
