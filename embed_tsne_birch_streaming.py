@@ -203,5 +203,48 @@ def main():
     plt.savefig(plot_path, dpi=300)
     print(f"Done! Plot saved to {plot_path}")
 
+    # --- 3. CLUSTER ANALYSIS OUTPUT ---
+    print("Generating cluster analysis report...")
+    report_path = "cluster_analysis.txt"
+    
+    # Create a DataFrame for analysis
+    # df is already loaded above with 'filename' as column 0
+    filenames = df.iloc[:, 0].tolist()
+    
+    analysis_df = pd.DataFrame({
+        'filename': filenames,
+        'cluster_id': y_birch
+    })
+    
+    # Sort by cluster ID then filename
+    analysis_df = analysis_df.sort_values(['cluster_id', 'filename'])
+    
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("BIRCH CLUSTER ANALYSIS REPORT\n")
+        f.write("="*40 + "\n\n")
+        
+        # Statistics
+        n_clusters = len(np.unique(y_birch))
+        f.write(f"Total Files: {len(filenames)}\n")
+        f.write(f"Total Clusters: {n_clusters}\n")
+        
+        counts = analysis_df['cluster_id'].value_counts()
+        f.write(f"Largest Cluster: ID {counts.idxmax()} ({counts.max()} files)\n")
+        f.write(f"Smallest Cluster: ID {counts.idxmin()} ({counts.min()} files)\n")
+        f.write(f"Average Files per Cluster: {counts.mean():.2f}\n\n")
+        
+        f.write("="*40 + "\n\n")
+        f.write("DETAILED CLUSTER LISTINGS\n\n")
+        
+        # Group listing
+        for cluster_id, group in analysis_df.groupby('cluster_id'):
+            files_in_cluster = group['filename'].tolist()
+            f.write(f"Cluster {cluster_id} ({len(files_in_cluster)} files):\n")
+            for fn in files_in_cluster:
+                f.write(f"  - {fn}\n")
+            f.write("\n")
+            
+    print(f"Analysis saved to {report_path}")
+
 if __name__ == "__main__":
     main()
